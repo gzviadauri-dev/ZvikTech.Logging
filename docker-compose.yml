@@ -1,0 +1,99 @@
+services:
+
+  # ── Elasticsearch ─────────────────────────────────────────────────────────
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    container_name: company-logging-es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Kibana ────────────────────────────────────────────────────────────────
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.0
+    container_name: company-logging-kibana
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - xpack.security.enabled=false
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  # ── Elastic APM Server ────────────────────────────────────────────────────
+  # Receives traces from Elastic APM agents and stores them in Elasticsearch.
+  # UI: Kibana → Observability → APM  (http://localhost:5601)
+  apm-server:
+    image: docker.elastic.co/apm/apm-server:8.13.0
+    container_name: company-logging-apm
+    ports:
+      - "8200:8200"
+    command: >
+      apm-server -e
+        -E apm-server.host=0.0.0.0:8200
+        -E apm-server.rum.enabled=true
+        -E setup.kibana.host=kibana:5601
+        -E setup.template.settings.index.number_of_replicas=0
+        -E apm-server.kibana.enabled=true
+        -E apm-server.kibana.host=kibana:5601
+        -E output.elasticsearch.hosts=["elasticsearch:9200"]
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  # ── Jaeger (all-in-one) ───────────────────────────────────────────────────
+  # Receives OTLP traces from the app and provides a trace-search UI.
+  # Trace UI:    http://localhost:16686
+  # OTLP gRPC:   http://localhost:4317
+  # OTLP HTTP:   http://localhost:4318
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: company-logging-jaeger
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC (set Telemetry:Otlp:Endpoint to http://localhost:4317)
+      - "4318:4318"     # OTLP HTTP/protobuf
+      - "14250:14250"   # Jaeger gRPC model (internal)
+      - "6831:6831/udp" # Jaeger Thrift UDP (legacy agents)
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+  # ── Sample Microservice ───────────────────────────────────────────────────
+  orders-api:
+    build:
+      context: .
+      dockerfile: src/SampleMicroservice/Dockerfile
+    container_name: orders-api
+    ports:
+      - "8080:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - CompanyLogging__Elasticsearch__Uri=http://elasticsearch:9200
+      # Enable OTLP export to Jaeger when running in Docker
+      - CompanyLogging__Telemetry__Otlp__Enabled=true
+      - CompanyLogging__Telemetry__Otlp__Endpoint=http://jaeger:4317
+      # Enable Elastic APM when running in Docker
+      - CompanyLogging__Telemetry__ElasticApm__Enabled=true
+      - CompanyLogging__Telemetry__ElasticApm__ServerUrl=http://apm-server:8200
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+volumes:
+  esdata:
+    driver: local

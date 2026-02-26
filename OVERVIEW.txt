@@ -1,0 +1,946 @@
+================================================================================
+  Company.Logging — Full Project Overview
+================================================================================
+
+  A production-ready structured logging and observability library for .NET 8
+  microservices. Built on Serilog and OpenTelemetry, it ships structured logs
+  to Elasticsearch in Elastic Common Schema (ECS) format, emits distributed
+  traces via OTLP / Elastic APM, publishes RED metrics, handles PII redaction,
+  correlation IDs, and read-back querying — all with a single NuGet package
+  and a few lines in Program.cs.
+
+--------------------------------------------------------------------------------
+1. WHAT PROBLEM THIS SOLVES
+--------------------------------------------------------------------------------
+
+Microservice teams without a shared observability library end up with:
+  - Different log field names across services (can't correlate in Kibana)
+  - Raw object dumps that cause Elasticsearch "mapping explosion" errors
+  - Passwords, tokens, and secrets accidentally written to logs
+  - No trace continuity — cannot follow a request across services
+  - The app crashes or blocks when Elasticsearch is unreachable
+  - Startup errors never captured because the logger is wired too late
+  - Metrics in a different format from every team
+  - No way to query logs programmatically from application code
+
+This library solves all of those with three NuGet packages and five lines
+in Program.cs.
+
+
+--------------------------------------------------------------------------------
+2. PACKAGE STRUCTURE
+--------------------------------------------------------------------------------
+
+The library is split into three NuGet packages. Each adds a layer of
+observability without requiring the ones below it.
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Company.Logging.Abstractions                                       │
+  │  Framework-agnostic interfaces and models. Zero Serilog dependency. │
+  │  Any service can reference this without pulling in the full stack.  │
+  │                                                                     │
+  │    ICorrelationContext     read correlation + request IDs from DI   │
+  │    ILogDataScope           push structured context into log scope   │
+  │    ILogReader              query + probe Elasticsearch logs         │
+  │    IActivitySourceFactory  create named ActivitySource instances    │
+  │    IMeterAccessor          create named Meter instances             │
+  │    LogData                 controlled structured log context model  │
+  │    LogQuery                filter parameters for ILogReader         │
+  │    LogEntry                one ECS document returned by ILogReader  │
+  │    LogQueryResult          paged result from ILogReader.QueryAsync  │
+  └─────────────────────────────────────────────────────────────────────┘
+         ↑ referenced by ↑
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Company.Logging.Serilog.AspNetCore                                 │
+  │  Full Serilog implementation for ASP.NET Core.                      │
+  │                                                                     │
+  │  Enrichers:  Service, Environment, Trace, Correlation, Actor        │
+  │  Filters:    RedactionPolicy, SamplingFilter                        │
+  │  Middleware: CorrelationMiddleware, LogDataScope                    │
+  │  Sink:       Elasticsearch (ECS data streams) + Console             │
+  │  Reading:    ElasticsearchLogReader (ILogReader impl)               │
+  └─────────────────────────────────────────────────────────────────────┘
+         ↑ referenced by ↑
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Company.Logging.Telemetry.AspNetCore                               │
+  │  OpenTelemetry traces + metrics alongside Serilog logging.          │
+  │                                                                     │
+  │  Tracing:  OTLP exporter, Elastic APM agent, ASP.NET Core spans     │
+  │  Metrics:  RED metrics middleware (requests, duration, errors)      │
+  │  Runtime:  .NET GC, heap, threadpool metrics via OTel SDK           │
+  │  Factories: DefaultActivitySourceFactory, DefaultMeterAccessor      │
+  └─────────────────────────────────────────────────────────────────────┘
+
+Integration in Program.cs:
+
+    // ── Logging (Serilog + Elasticsearch) ──────────────────────────
+    builder.Host.UseCompanySerilog(builder.Configuration);
+    builder.Services.AddCompanyLogging(builder.Configuration);
+
+    // ── Telemetry (OpenTelemetry traces + metrics) ──────────────────
+    builder.Services.AddCompanyTelemetry(builder.Configuration);
+
+    // ── Log reading (query Elasticsearch from application code) ─────
+    builder.Services.AddCompanyLogReading(builder.Configuration);
+
+    var app = builder.Build();
+
+    app.UseCompanyLogging();    // correlation middleware + request logging
+    app.UseCompanyTelemetry();  // RED metrics middleware
+
+
+--------------------------------------------------------------------------------
+3. REQUEST LIFECYCLE — what happens on every HTTP request
+--------------------------------------------------------------------------------
+
+Step 1 — CorrelationMiddleware (earliest in pipeline)
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  Reads X-Correlation-Id header (or configured name).                    │
+  │  If absent, blank, or > 128 chars: generates a new GUID.               │
+  │  Stores correlation ID + ASP.NET TraceIdentifier in AsyncLocal.         │
+  │  Pushes correlation.id and request.id into Serilog LogContext.          │
+  │  Registers ICorrelationContext in HttpContext.Items for DI injection.   │
+  │  Adds correlation ID to the response header.                            │
+  │                                                                         │
+  │  NEW: starts a fallback Activity("HTTP {method} {path}") with tags      │
+  │       http.method, http.route, http.status_code — but ONLY when         │
+  │       Activity.Current is null (i.e. no OTEL instrumentation running).  │
+  │       This gives a baseline trace even in services without full OTEL.   │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+Step 2 — CompanyMetricsMiddleware (second in pipeline, only if telemetry added)
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  Starts a Stopwatch, increments company.http.requests.active counter.   │
+  │  Calls next() (the rest of the pipeline).                               │
+  │  On completion: records duration histogram + requests.total counter.    │
+  │  On unhandled exception: records company.errors.total tagged by CLR     │
+  │    exception type name, then re-throws.                                 │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+Step 3 — SerilogRequestLogging (per-request summary line)
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  Logs: "HTTP POST /orders responded 201 in 47.3 ms"                     │
+  │  Adds ECS fields: http.method, http.route, http.status_code,            │
+  │    elapsed_ms, client.ip, http.scheme, http.host.                       │
+  │  Log level: Verbose for excluded paths, Error for 5xx, Warning for 4xx, │
+  │    Information otherwise. All thresholds configurable.                  │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+Step 4 — Enrichers (run on every log event, not just per-request)
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  ServiceEnricher     → service.name, service.version, service.instance  │
+  │  EnvironmentEnricher → deployment.environment, cloud.region             │
+  │  TraceEnricher       → trace.id, span.id, transaction.id from Activity  │
+  │  CorrelationEnricher → correlation.id, request.id from AsyncLocal       │
+  │  ActorEnricher       → user.id, client.id, organization.id from JWT     │
+  │                        (opaque identifiers only — never PII)            │
+  │                                                                         │
+  │  ServiceEnricher and EnvironmentEnricher pre-compute LogEventProperty   │
+  │  at startup and reuse them — zero allocations per log call.             │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+Step 5 — Filters
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  RedactionPolicy   → replaces sensitive property values with "***".     │
+  │                      Case-insensitive key match against configured list. │
+  │                      Catches values passed via {password} templates.    │
+  │                                                                         │
+  │  SamplingFilter    → deterministically drops a fraction of 2xx request  │
+  │                      events to reduce Elasticsearch write volume.       │
+  │                      Warnings, errors, fatals are NEVER dropped.        │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+Step 6 — Sinks write the final event
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  Console     → ECS JSON to stdout. Always active.                       │
+  │  Elasticsearch → Data Stream logs-{service}-{env} via Elastic.Serilog.  │
+  │                  Wrapped in WriteTo.Async (10,000 event buffer, non-     │
+  │                  blocking drop on overflow).                             │
+  │                  Config failures caught silently; app uses console-only. │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+Step 7 — On graceful shutdown
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  ApplicationStopped event calls Log.CloseAndFlush().                    │
+  │  The async buffer drains before the process exits. No events lost.      │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+--------------------------------------------------------------------------------
+4. STRUCTURED LOG CONTEXT: LogData
+--------------------------------------------------------------------------------
+
+The biggest operational risk with Elasticsearch is "mapping explosion": sending
+objects with varying field names causes ES to create unbounded dynamic mappings
+until it starts rejecting documents.
+
+LogData is the library's answer: a controlled, whitelist-friendly model you push
+into a log scope rather than directly into the message template.
+
+  Properties:
+    Tags        Dictionary<string, string>   safe keyword fields for ES
+    Meta        Dictionary<string, object?>  typed metadata; subject to whitelist
+    EventName   string?                      domain event, e.g. "order.created"
+    EntityType  string?                      entity being acted on, e.g. "Order"
+    EntityId    string?                      entity identifier, e.g. "order-abc"
+
+  Fluent builder example:
+
+    var data = LogData.Create()
+        .WithEvent("order.shipped")
+        .WithEntity("Order", orderId)
+        .WithTag("shipping.carrier", "FedEx")
+        .WithTag("shipping.service", "express")
+        .WithMeta("weight_kg", 2.4);
+
+    using var scope = logScope.BeginScope(data);
+    logger.LogInformation("Order {OrderId} dispatched to {Address}", orderId, addr);
+
+  This produces the following fields in Elasticsearch:
+    event.action          = "order.shipped"
+    entity.type           = "Order"
+    entity.id             = "<orderId>"
+    tag.shipping.carrier  = "FedEx"
+    tag.shipping.service  = "express"
+    meta.weight_kg        = 2.4
+
+  MetaKeyWhitelist
+    Set CompanyLogging.MetaKeyWhitelist to restrict which Meta keys reach ES.
+    Tags are always allowed through — they are string-only and safe for keywords.
+    This prevents runaway meta keys from exploding the ES field count.
+
+    Example config:
+      "MetaKeyWhitelist": ["weight_kg", "item_count", "retry_attempt"]
+
+
+--------------------------------------------------------------------------------
+5. OPENTELEMETRY TELEMETRY — Traces + Metrics
+--------------------------------------------------------------------------------
+
+5a. HOW TRACING WORKS
+---------------------
+
+AddCompanyTelemetry() registers the OpenTelemetry SDK and configures:
+
+  1. ResourceBuilder
+     Sets service.name, service.version, and telemetry.sdk.* on every span.
+     Used by Jaeger and Elastic APM to group traces by service.
+
+  2. Sampler
+     SampleRatio = 1.0  → AlwaysOnSampler (all traces captured)
+     SampleRatio = 0.25 → TraceIdRatioBasedSampler(0.25) (25% of traces)
+     Useful in high-throughput production to reduce APM storage cost.
+
+  3. ActivitySources (what gets traced)
+     Default:  "Company.{ServiceName}"   — your custom business spans
+     Optional: InstrumentAspNetCore=true → traces all incoming HTTP requests
+               InstrumentHttpClient=true → traces all outgoing HttpClient calls
+               AdditionalSources: ["MyApp.Payments", "MyApp.Inventory"]
+
+  4. Exporters
+     OTLP (Jaeger, Grafana, Honeycomb, etc.) — set Otlp.Enabled=true
+     Elastic APM agent                        — set ElasticApm.Enabled=true
+     Both can be active simultaneously.
+
+How Serilog logs and OTel spans share trace.id:
+
+  When OTel instruments an incoming HTTP request, it creates a root Activity
+  (span). Activity.Current is set to that span. TraceEnricher reads
+  Activity.Current on every Serilog log call and adds trace.id + span.id
+  to the log event. Because both the log event and the APM trace carry the same
+  trace.id (32 hex chars, W3C format), you can click a log line in Kibana
+  Discover and jump directly to the APM waterfall for that trace.
+
+5b. CREATING CUSTOM SPANS
+--------------------------
+
+Inject IActivitySourceFactory anywhere and call GetSource() to get the
+pre-configured ActivitySource for your service:
+
+    // In a handler / endpoint:
+    app.MapPost("/orders", async (
+        IActivitySourceFactory asf,
+        ILogger<Program> logger,
+        ...) =>
+    {
+        // This span is automatically a child of the incoming HTTP request span.
+        // trace.id is the same as the HTTP span — Serilog picks it up too.
+        using var span = asf.GetSource().StartActivity("ProcessOrder");
+        span?.SetTag("order.id",         orderId);
+        span?.SetTag("order.item_count", items.Count);
+        span?.SetTag("order.currency",   "USD");
+
+        logger.LogInformation("Processing order {OrderId}", orderId);
+        // ↑ this log carries the same trace.id as the span above
+
+        await DoWorkAsync();
+
+        span?.SetTag("order.status", "created");
+        return Results.Created($"/orders/{orderId}", order);
+    });
+
+    // In a service class:
+    public class OrderService
+    {
+        private readonly IActivitySourceFactory _asf;
+        private readonly ILogger<OrderService> _logger;
+
+        public async Task ValidatePaymentAsync(string orderId)
+        {
+            using var span = _asf.GetSource().StartActivity("ValidatePayment");
+            span?.SetTag("order.id", orderId);
+
+            _logger.LogInformation("Validating payment for {OrderId}", orderId);
+            // ... work ...
+        }
+    }
+
+5c. HOW METRICS WORK
+---------------------
+
+CompanyMetricsMiddleware (added by UseCompanyTelemetry()) wraps every request:
+
+    Request arrives
+        → HttpRequestsActive.Add(+1)
+        → Stopwatch.Start()
+        → next(context)                  ← your endpoint runs
+        → Stopwatch.Stop()
+        → HttpRequestsActive.Add(-1)
+        → HttpRequestsTotal.Add(1, tags)
+        → HttpRequestsDuration.Record(ms, tags)
+        → (on exception) ErrorsTotal.Add(1, tags)
+
+  Tags on all instruments:
+    http.method       "GET", "POST", ...
+    http.route        "/orders/{id}", "POST /orders", ...
+    http.status_code  200, 201, 400, 500, ...
+
+  Error counter tags:
+    exception.type    "InvalidOperationException", "TimeoutException", ...
+    http.method
+    http.route
+
+5d. CREATING CUSTOM METRICS
+-----------------------------
+
+Inject IMeterAccessor to get the pre-configured Meter for your service:
+
+    public class PaymentService
+    {
+        private readonly Counter<long> _paymentsProcessed;
+        private readonly Histogram<double> _paymentAmount;
+
+        public PaymentService(IMeterAccessor meterAccessor)
+        {
+            var meter = meterAccessor.GetMeter();
+
+            _paymentsProcessed = meter.CreateCounter<long>(
+                "payments.processed.total",
+                description: "Total payments processed.");
+
+            _paymentAmount = meter.CreateHistogram<double>(
+                "payments.amount",
+                unit: "USD",
+                description: "Distribution of payment amounts.");
+        }
+
+        public async Task ProcessPaymentAsync(decimal amount, string currency)
+        {
+            // ... process ...
+            _paymentsProcessed.Add(1, new TagList
+            {
+                { "currency", currency },
+                { "method", "card" }
+            });
+            _paymentAmount.Record((double)amount, new TagList
+            {
+                { "currency", currency }
+            });
+        }
+    }
+
+5e. BUILT-IN METRIC INSTRUMENTS
+---------------------------------
+
+All instruments are under the meter named "Company.{ServiceName}":
+
+  Name                            Type            Unit      Description
+  ─────────────────────────────────────────────────────────────────────────
+  company.http.requests.total     Counter<long>   request   Completed requests
+  company.http.requests.duration  Histogram<dbl>  ms        Request latency
+  company.http.requests.active    UpDownCounter   request   In-flight requests
+  company.errors.total            Counter<long>   error     Unhandled exceptions
+
+  (Plus all ASP.NET Core, HttpClient, and .NET Runtime meters when enabled)
+
+5f. EXPORTERS AND BACKENDS
+----------------------------
+
+  Backend         Endpoint              Protocol        When to use
+  ──────────────────────────────────────────────────────────────────
+  Jaeger          http://localhost:4317  OTLP gRPC      Local dev trace UI
+  Grafana Tempo   your-url:4317          OTLP gRPC      Self-hosted traces
+  Honeycomb       api.honeycomb.io:443   OTLP gRPC      SaaS traces/metrics
+  Elastic APM     http://apm:8200        Native agent   Full Elastic stack
+  Any OTLP        your-url               OTLP gRPC/HTTP Any OpenTelemetry vendor
+
+  Configure in appsettings.json:
+
+    "Telemetry": {
+      "Enabled": true,
+      "Otlp": {
+        "Enabled": true,
+        "Endpoint": "http://localhost:4317",
+        "Protocol": "grpc"
+      },
+      "ElasticApm": {
+        "Enabled": false,
+        "ServerUrl": "http://apm-server:8200",
+        "SecretToken": ""
+      },
+      "Tracing": {
+        "SampleRatio": 1.0,
+        "InstrumentAspNetCore": true,
+        "InstrumentHttpClient": true,
+        "AdditionalSources": ["MyApp.Custom"]
+      },
+      "Metrics": {
+        "InstrumentRuntime": true,
+        "AdditionalMeters": ["MyApp.Business"]
+      }
+    }
+
+
+--------------------------------------------------------------------------------
+6. LOG READING: ILogReader
+--------------------------------------------------------------------------------
+
+Once logs are in Elasticsearch, the library lets you query them back from
+application code — useful for audit trails, admin dashboards, and health checks.
+
+6a. REGISTERING THE READER
+---------------------------
+
+    builder.Services.AddCompanyLogReading(builder.Configuration);
+    // Uses the same ElasticsearchOptions as the write pipeline.
+    // Registers ILogReader → ElasticsearchLogReader as a scoped service.
+    // Configures an HttpClient with the same auth (API key or Basic Auth).
+
+6b. QUERYING LOGS
+------------------
+
+    // Inject ILogReader in a minimal API endpoint, controller, or service:
+    app.MapGet("/admin/logs", async (ILogReader reader, CancellationToken ct) =>
+    {
+        var result = await reader.QueryAsync(new LogQuery
+        {
+            ServiceName   = "orders-api",
+            MinLevel      = LogLevel.Warning,
+            From          = DateTimeOffset.UtcNow.AddHours(-1),
+            SearchText    = "payment failed",
+            PageSize      = 25,
+            PageIndex     = 0
+        }, ct);
+
+        return new {
+            result.TotalCount,
+            result.HasMore,
+            Entries = result.Entries.Select(e => new {
+                e.Timestamp,
+                e.Level,
+                e.Message,
+                e.CorrelationId,
+                e.TraceId
+            })
+        };
+    });
+
+  LogQuery filters (all optional):
+    ServiceName    exact match on service.name
+    Environment    exact match on deployment.environment
+    MinLevel       returns this level and above (maps to ECS level strings)
+    From / To      time window (defaults to last 24 hours)
+    CorrelationId  exact match on correlation.id — find all logs for a request
+    TraceId        exact match on trace.id — find all logs for a trace
+    SearchText     full-text search on message field
+    PageSize       max 1,000 per page (default 50)
+    PageIndex      zero-based page index
+
+  LogEntry fields returned:
+    Timestamp, Level, Message
+    ServiceName, ServiceVersion, InstanceId, Environment
+    CorrelationId, TraceId, SpanId
+    UserId, EventAction, EntityType, EntityId
+    Extra (all other ECS fields not mapped above, as dotted key → string)
+
+6c. PROBE: WRITE-READ ROUND-TRIP HEALTH CHECK
+----------------------------------------------
+
+    // Verifies the full write → read pipeline is working end-to-end.
+    // Writes a probe document directly to ES (?refresh=true),
+    // immediately reads it back, deletes it, and returns the LogEntry.
+
+    app.MapGet("/health/logging", async (ILogReader reader) =>
+    {
+        try
+        {
+            var entry = await reader.ProbeAsync();
+            return Results.Ok(new {
+                status    = "ok",
+                timestamp = entry.Timestamp,
+                message   = entry.Message
+            });
+        }
+        catch (Exception ex)
+        {
+            return Results.Problem($"ES read/write failed: {ex.Message}");
+        }
+    });
+
+    // Works with ASP.NET Core health checks:
+    builder.Services.AddHealthChecks()
+        .AddAsyncCheck("elasticsearch", async (ct) => {
+            await reader.ProbeAsync(ct);
+            return HealthCheckResult.Healthy("Elasticsearch read/write OK");
+        });
+
+  ProbeAsync does NOT go through Serilog's async channel.
+  It writes directly to ES with ?refresh=true, which guarantees the document
+  is indexed before the read attempt. This makes the probe deterministic and
+  fast (one HTTP round-trip), regardless of Serilog's batch flush interval.
+
+
+--------------------------------------------------------------------------------
+7. CORRELATION, TRACE, AND LOG LINKING
+--------------------------------------------------------------------------------
+
+The library provides two complementary correlation mechanisms:
+
+  MECHANISM 1 — Correlation ID (business / cross-service)
+  ────────────────────────────────────────────────────────
+  Purpose: trace one user action across multiple microservices.
+
+    Inbound:  Read X-Correlation-Id header → generate GUID if missing
+    Storage:  AsyncLocal (CorrelationContext) + Serilog LogContext
+    Outbound: Forward header in downstream HttpClient calls:
+                client.DefaultRequestHeaders.Add(
+                    "X-Correlation-Id", correlationContext.CorrelationId);
+
+  ES log field: correlation.id
+  Available in code: inject ICorrelationContext
+
+  MECHANISM 2 — W3C Trace Context (OpenTelemetry)
+  ─────────────────────────────────────────────────
+  Purpose: distributed traces with timing data and span hierarchy.
+
+    Created by: OTel ASP.NET Core instrumentation (or CorrelationMiddleware
+                fallback when OTel is not installed)
+    Storage:   Activity.Current (W3C propagation across services via
+               traceparent header)
+
+  ES log fields: trace.id (32 hex), span.id (16 hex), transaction.id
+  APM field:     same trace.id — Kibana APM links directly to log
+
+  LINKING IN KIBANA
+  ──────────────────
+  Because every log event carries trace.id (from TraceEnricher) and every APM
+  span carries the same trace.id, you can:
+
+    1. Find a log line in Kibana Discover.
+    2. Filter by trace.id → see all log lines for the same request.
+    3. Click "View in APM" → see the full span waterfall with timing.
+    4. Filter by correlation.id → see logs across all services for one action.
+
+  Diagram:
+
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  Browser → POST /orders  X-Correlation-Id: abc-123                 │
+    │                   ↓                                                 │
+    │  CorrelationMiddleware   correlation.id = "abc-123"                 │
+    │  OTEL AspNetCore         trace.id       = "4bf9...4736"            │
+    │                   ↓                                                 │
+    │  OrderService.LogInformation(...)  ← log carries BOTH IDs          │
+    │                   ↓                                                 │
+    │  → POST /payments  X-Correlation-Id: abc-123  traceparent: 4bf9... │
+    │           ↓                                                         │
+    │  PaymentService.LogInformation(...)  ← same correlation.id + trace │
+    └─────────────────────────────────────────────────────────────────────┘
+
+    Kibana search: correlation.id: "abc-123"
+    → Shows logs from OrderService AND PaymentService in one view.
+
+    Kibana APM:   trace.id: "4bf9...4736"
+    → Shows the full span waterfall with timing across both services.
+
+
+--------------------------------------------------------------------------------
+8. SECURITY FEATURES
+--------------------------------------------------------------------------------
+
+  PII Redaction
+    RedactionPolicy is a Serilog ILogEventEnricher applied before any sink.
+    Every property value on every log event is inspected.
+    Property names are matched case-insensitively against SensitiveKeys.
+    Default list: password, passwd, secret, token, apikey, api_key,
+      authorization, auth, credential, credentials, connectionstring,
+      connection_string, privatekey, private_key, clientsecret, client_secret.
+    Matched values → replaced with RedactedValue (default "***").
+    Works on values injected via structured templates like logger.Log("{password}", value).
+
+  ActorEnricher — identity without PII
+    Reads JWT claims from the authenticated user principal.
+    Logs only opaque identifiers:
+      user.id          → "sub" claim
+      client.id        → "azp" claim (OAuth2 client)
+      organization.id  → "tid" or "tenant_id" claim
+    Never logs display names, email addresses, or any PII claim.
+
+  Correlation ID injection guard
+    Incoming X-Correlation-Id is rejected if blank, whitespace, or > 128 chars.
+    Prevents log injection attacks via crafted headers.
+
+  Telemetry failure isolation
+    All exporter registrations (OTLP, Elastic APM) are wrapped in try/catch.
+    A bad endpoint URL or auth error writes to Trace.WriteLine and is skipped.
+    The host never fails to start because of a bad telemetry configuration.
+
+
+--------------------------------------------------------------------------------
+9. RESILIENCE AND PERFORMANCE
+--------------------------------------------------------------------------------
+
+  Async Serilog buffer
+    All sinks wrapped in WriteTo.Async (default: 10,000 event queue).
+    When full: excess events dropped (BlockWhenFull=false).
+    Elasticsearch write latency NEVER bleeds into HTTP request latency.
+
+  Elasticsearch failure handling
+    ConfigureElasticsearchSink wrapped in try/catch.
+    Bad config → SelfLog warning, app continues with console-only.
+    The app will never fail to start because of a bad ES config.
+
+  Durable disk buffer
+    Set Elasticsearch.DurableBufferPath to a filesystem path.
+    Events written to disk first; replayed when ES becomes reachable.
+    Prevents data loss during ES downtime without blocking requests.
+
+  Bootstrap logger
+    A minimal Serilog (warning-level console) is created before host.Build().
+    Captures exceptions during DI registration, config binding, and startup.
+    Replaced by the full Serilog pipeline once the host is built.
+
+  Options validation on startup
+    ValidateDataAnnotations() + ValidateOnStart() on all options.
+    Range constraints on all numeric settings enforced at startup.
+    Misconfigured service fails immediately with a clear error.
+
+  MetricsMiddleware — zero-overhead when disabled
+    CompanyMetricsMiddleware is only added to the pipeline via UseCompanyTelemetry().
+    If AddCompanyTelemetry() is not called, the middleware is not registered.
+    Stopwatch.Start/Stop adds < 0.1 µs overhead per request when active.
+
+  OTel sampler cost
+    AlwaysOnSampler  → zero decision cost per trace.
+    TraceIdRatioBasedSampler(0.1) → hash of trace ID, no heap allocation.
+
+
+--------------------------------------------------------------------------------
+10. ELASTICSEARCH OUTPUT FORMAT (ECS)
+--------------------------------------------------------------------------------
+
+All fields follow Elastic Common Schema naming. A full log event:
+
+  {
+    "@timestamp":             "2026-02-26T14:23:01.123Z",
+    "log.level":              "information",
+    "message":                "Order order-abc123 created",
+
+    // Service identity (ServiceEnricher)
+    "service.name":           "orders-api",
+    "service.version":        "1.0.0",
+    "service.instance.id":    "orders-pod-7f9d",
+
+    // Environment (EnvironmentEnricher)
+    "deployment.environment": "prod",
+    "cloud.region":           "us-east-1",
+
+    // Correlation (CorrelationMiddleware + CorrelationEnricher)
+    "correlation.id":         "abc-123",
+    "request.id":             "0HMXYZ:0001",
+
+    // Trace / OTel (TraceEnricher — reads Activity.Current)
+    "trace.id":               "4bf92f3577b34da6a3ce929d0e0e4736",
+    "span.id":                "a3ce929d0e0e4736",
+    "transaction.id":         "a3ce929d0e0e4736",
+
+    // Actor identity (ActorEnricher — from JWT, opaque IDs only)
+    "user.id":                "sub-abc",
+    "client.id":              "client-xyz",
+    "organization.id":        "tenant-001",
+
+    // HTTP summary (SerilogRequestLogging)
+    "http.method":            "POST",
+    "http.route":             "POST /orders",
+    "http.status_code":       201,
+    "elapsed_ms":             47.3,
+    "client.ip":              "10.0.0.5",
+
+    // Business context (LogData via ILogDataScope)
+    "event.action":           "order.created",
+    "entity.type":            "Order",
+    "entity.id":              "order-abc123",
+    "tag.order.currency":     "USD",
+    "tag.order.item_count":   "3",
+    "meta.weight_kg":         2.4,
+
+    // Host (standard Serilog enrichers)
+    "host.name":              "orders-pod-7f9d",
+    "process.pid":            42,
+    "thread.id":              8
+  }
+
+Data stream name: logs-orders-api-prod
+Pattern:          logs-{ServiceName}-{Environment}
+                  (spaces normalized to hyphens, lowercased)
+
+
+--------------------------------------------------------------------------------
+11. PROJECT STRUCTURE
+--------------------------------------------------------------------------------
+
+  Company.Logging/
+  ├── Company.Logging.sln
+  ├── global.json                          .NET 8 SDK pin
+  ├── docker-compose.yml                   ES + Kibana + Jaeger + APM + sample API
+  ├── README.md                            Quick-start guide
+  ├── OVERVIEW.txt                         This file
+  │
+  ├── src/
+  │   ├── Company.Logging.Abstractions/
+  │   │   ├── Interfaces/
+  │   │   │   ├── ICorrelationContext.cs    Read correlation/request IDs
+  │   │   │   ├── ILogDataScope.cs          Push LogData into log scope
+  │   │   │   ├── ILogReader.cs             Query / probe Elasticsearch
+  │   │   │   ├── IActivitySourceFactory.cs Create ActivitySource instances
+  │   │   │   └── IMeterAccessor.cs         Create Meter instances
+  │   │   └── Models/
+  │   │       ├── LogData.cs                Structured log context model
+  │   │       ├── LogQuery.cs               Filter params for ILogReader
+  │   │       ├── LogEntry.cs               One ECS document from ILogReader
+  │   │       └── LogQueryResult.cs         Paged result set from ILogReader
+  │   │
+  │   ├── Company.Logging.Serilog.AspNetCore/
+  │   │   ├── Configuration/
+  │   │   │   └── CompanyLoggingOptions.cs  All logging configuration
+  │   │   ├── Enrichers/
+  │   │   │   ├── ActorEnricher.cs          JWT identity fields
+  │   │   │   ├── CorrelationEnricher.cs    correlation.id, request.id
+  │   │   │   ├── EnvironmentEnricher.cs    deployment.environment, region
+  │   │   │   ├── ServiceEnricher.cs        service.name, version, instance
+  │   │   │   └── TraceEnricher.cs          trace.id, span.id from Activity
+  │   │   ├── Extensions/
+  │   │   │   ├── CompanyLoggingExtensions.cs  DI registration + middleware
+  │   │   │   └── SerilogConfigurator.cs        Builds LoggerConfiguration
+  │   │   ├── Filters/
+  │   │   │   ├── RedactionPolicy.cs        Replaces sensitive values with ***
+  │   │   │   └── SamplingFilter.cs         Deterministic success sampling
+  │   │   ├── Middleware/
+  │   │   │   ├── CorrelationMiddleware.cs           Correlation + fallback span
+  │   │   │   ├── HttpContextCorrelationContextAccessor.cs
+  │   │   │   └── LogDataScope.cs                    ILogDataScope impl
+  │   │   └── Reading/
+  │   │       └── ElasticsearchLogReader.cs  ILogReader implementation
+  │   │
+  │   ├── Company.Logging.Telemetry.AspNetCore/
+  │   │   ├── Configuration/
+  │   │   │   └── TelemetryOptions.cs       All telemetry configuration
+  │   │   ├── Extensions/
+  │   │   │   └── CompanyTelemetryExtensions.cs  AddCompanyTelemetry / Use...
+  │   │   ├── Instrumentation/
+  │   │   │   ├── DefaultActivitySourceFactory.cs  IActivitySourceFactory impl
+  │   │   │   └── DefaultMeterAccessor.cs           IMeterAccessor impl
+  │   │   └── Metrics/
+  │   │       └── CompanyMetricsCollector.cs  RED instruments + middleware
+  │   │
+  │   └── SampleMicroservice/
+  │       ├── Program.cs                    Full integration demo
+  │       ├── appsettings.json              Dev config (all features enabled)
+  │       ├── appsettings.Production.json   Prod overrides
+  │       └── Dockerfile                    Multi-stage Docker build
+  │
+  └── tests/
+      └── Company.Logging.Tests/
+          ├── ActivitySourceFactoryTests.cs      Source naming + singleton cache
+          ├── CompanyMetricsCollectorTests.cs    Counter/histogram/tag verification
+          ├── ConfigurationBindingTests.cs       Options bind from JSON
+          ├── CorrelationMiddlewareTests.cs      Header handling, GUID generation
+          ├── CorrelationMiddlewareTraceTests.cs Activity creation + tag checks
+          ├── RedactionPolicyTests.cs            Sensitive key replacement
+          ├── SamplingFilterTests.cs             Sampling rate, error pass-through
+          ├── TelemetryOptionsBindingTests.cs    Telemetry options binding
+          └── TraceEnricherTests.cs              W3C format, no-Activity path
+
+
+--------------------------------------------------------------------------------
+12. CONFIGURATION QUICK REFERENCE
+--------------------------------------------------------------------------------
+
+All settings live under "CompanyLogging" in appsettings.json.
+Override via environment variable with double-underscore separator:
+
+  CompanyLogging__ServiceName=payments-api
+  CompanyLogging__Elasticsearch__Uri=http://es:9200
+  CompanyLogging__Telemetry__Otlp__Enabled=true
+  CompanyLogging__Telemetry__Otlp__Endpoint=http://jaeger:4317
+
+── LOGGING OPTIONS ────────────────────────────────────────────────────────────
+
+  Key                              Default            Validated Range
+  ──────────────────────────────────────────────────────────────────
+  ServiceName                      "unknown-service"  required
+  ServiceVersion                   (assembly ver.)    –
+  Environment                      "dev"              required
+  Region                           null               –
+  CorrelationHeader                "X-Correlation-Id" required
+  EnableRequestLogging             true               –
+  EnableBodyLogging                false              –
+  BodySizeLimitBytes               4096               1–1,048,576
+  RequestLoggingWarnAboveStatus    400                100–599
+  RequestLoggingErrorAboveStatus   500                100–599
+  MetaKeyWhitelist                 []                 –
+
+  Redaction:
+    SensitiveKeys                  [password, ...]    –
+    RedactedValue                  "***"              –
+
+  Sampling:
+    SampleSuccessRequests          false              –
+    SuccessSampleRate              10                 >= 1
+
+  Elasticsearch:
+    Enabled                        true               –
+    Uri                            "http://localhost:9200"  required
+    AutoRegisterTemplate           true               –
+    BatchPostingLimit              1000               1–10,000
+    PeriodSeconds                  2                  1–300
+    Username / Password            null               –
+    ApiKey                         null               –
+    CloudId                        null               –
+    DurableBufferPath              null               –
+
+  Async:
+    Enabled                        true               –
+    BufferSize                     10000              100–1,000,000
+    BlockWhenFull                  false              –
+
+── TELEMETRY OPTIONS ──────────────────────────────────────────────────────────
+
+  Key                                         Default    Description
+  ──────────────────────────────────────────────────────────────────────────
+  Telemetry.Enabled                           true       Master switch
+  Telemetry.ServiceName                       ""         Overrides logging ServiceName
+  Telemetry.ServiceVersion                    ""         Overrides logging ServiceVersion
+
+  Telemetry.Otlp.Enabled                      false      Send traces+metrics via OTLP
+  Telemetry.Otlp.Endpoint                     localhost:4317
+  Telemetry.Otlp.Protocol                     "grpc"     "grpc" | "http/protobuf"
+
+  Telemetry.ElasticApm.Enabled                false      Activate Elastic APM agent
+  Telemetry.ElasticApm.ServerUrl              localhost:8200
+  Telemetry.ElasticApm.ApiKey                 ""
+  Telemetry.ElasticApm.SecretToken            ""
+
+  Telemetry.Tracing.Enabled                   true
+  Telemetry.Tracing.SampleRatio               1.0        0.0–1.0
+  Telemetry.Tracing.InstrumentAspNetCore      true
+  Telemetry.Tracing.InstrumentHttpClient      true
+  Telemetry.Tracing.InstrumentEntityFramework false
+  Telemetry.Tracing.InstrumentSqlClient       false
+  Telemetry.Tracing.AdditionalSources         []
+
+  Telemetry.Metrics.Enabled                   true
+  Telemetry.Metrics.InstrumentAspNetCore      true
+  Telemetry.Metrics.InstrumentHttpClient      true
+  Telemetry.Metrics.InstrumentRuntime         true       GC, heap, threadpool
+  Telemetry.Metrics.AdditionalMeters          []
+
+
+--------------------------------------------------------------------------------
+13. CI/CD PIPELINE
+--------------------------------------------------------------------------------
+
+The GitHub Actions workflow (.github/workflows/ci.yml) has three jobs:
+
+  build-and-test
+    Triggers on push to main/develop and on pull requests to main.
+    Restores, builds (Release), runs all tests (45 total).
+    Collects Cobertura code coverage. Uploads results and coverage.
+
+  pack  (after build-and-test passes)
+    Version from Git tag (v1.2.3 → 1.2.3); non-tags → 1.0.0-preview.<run>.
+    Packs three NuGet packages:
+      Company.Logging.Abstractions.nupkg
+      Company.Logging.Serilog.AspNetCore.nupkg
+      Company.Logging.Telemetry.AspNetCore.nupkg
+    Each with matching .snupkg symbol packages.
+    Uploads all as artifacts.
+
+  publish  (after pack, only on v*.*.* tags)
+    Downloads packed artifacts.
+    Pushes to GitHub Packages (nuget.pkg.github.com/gzviadauri-dev).
+    Uses GITHUB_TOKEN. --skip-duplicate prevents re-run failures.
+
+To release a new version:
+    git tag v1.2.0
+    git push origin v1.2.0
+
+
+--------------------------------------------------------------------------------
+14. LOCAL DEVELOPMENT SETUP
+--------------------------------------------------------------------------------
+
+Prerequisites: Docker Desktop, .NET 8 SDK
+
+Start the full local stack (Elasticsearch + Kibana + Jaeger + APM Server):
+    docker compose up -d
+
+Or just the logging backends:
+    docker compose up -d elasticsearch kibana
+
+Services exposed locally:
+    http://localhost:9200   Elasticsearch REST API
+    http://localhost:5601   Kibana (Logs: Discover → data view logs-*)
+    http://localhost:8200   Elastic APM Server
+    http://localhost:16686  Jaeger Trace UI
+    http://localhost:4317   OTLP gRPC endpoint (Jaeger collector)
+    http://localhost:4318   OTLP HTTP endpoint (Jaeger collector)
+
+Run the sample microservice:
+    cd src/SampleMicroservice
+    dotnet run
+
+Sample endpoints:
+    POST /orders                  Create an order with LogData + custom span
+    GET  /orders/{id}             Retrieve order; shows trace span + correlation
+    GET  /orders/error-demo       Throws and logs an exception (error counter++)
+    GET  /health                  Health check (excluded from request logging)
+
+Swagger UI: http://localhost:5000/swagger
+Kibana:     http://localhost:5601  →  Discover  →  data view: logs-*
+Jaeger:     http://localhost:16686 →  Search  →  service: orders-api
+
+To send traces to Jaeger from local dev, add to appsettings.Development.json:
+    {
+      "CompanyLogging": {
+        "Telemetry": {
+          "Otlp": { "Enabled": true, "Endpoint": "http://localhost:4317" }
+        }
+      }
+    }
+
+Run tests:
+    dotnet test Company.Logging.sln
+    dotnet test Company.Logging.sln --filter "CorrelationMiddleware"
+
+
+================================================================================

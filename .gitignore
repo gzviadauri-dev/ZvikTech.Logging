@@ -1,0 +1,22 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+artifacts/
+TestResults/
+*.coverage
+*.cobertura.xml
+
+## NuGet
+*.nupkg
+*.snupkg
+nuget.config.local
+
+## Rider / VS Code
+.idea/
+.vscode/
+
+## Docker
+.dockerignore
